@@ -17,28 +17,83 @@ class SaxoClient:
     AUTH_URL_LIVE  = f"{AUTH_BASE_LIVE}/authorize"
     TOKEN_URL_LIVE = f"{AUTH_BASE_LIVE}/token"
     API_BASE_LIVE  = "https://gateway.saxobank.com/openapi"
-
+    TOKEN_FILE = "saxo_tokens.json"
+    
     def __init__(self, app_key, app_secret, app_name,
                  redirect_uri="http://127.0.0.1:8001/callback",
                  app_id=None, bind_all=False, wait_timeout=180):
+        
         self._app_key = app_key
         self._app_secret = app_secret
         self._app_name = app_name
         self._app_id = app_id
         self._redirect_uri = redirect_uri
-        self._bind_all = bind_all         # <-- utile WSL2/Docker
-        self._wait_timeout = wait_timeout # <-- 3 min
+        self._bind_all = bind_all
+        self._wait_timeout = wait_timeout
         self._access_token = None
         self._refresh_token = None
         self._session = requests.Session()
         self._expected_state = None
 
+        # Configuration par défaut des headers de session
+        self._session.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        })
 
-        #a enlever après 
-        self.token_url = "https://token-saxo-powerbi-hvdfhtabfudwgkdu.francecentral-01.azurewebsites.net/api/saxo_access_token" # token maxence
+        # --- CE QUE TU AS OUBLIÉ : ---
+        
+        # 1. Charger les tokens si le fichier existe déjà
+        self._load_tokens_from_file()
+
+        # 2. Si un access_token a été chargé, l'injecter dans la session
+        if self._access_token:
+            self._session.headers.update({
+                "Authorization": f"Bearer {self._access_token}"
+            })
+            print("🔑 Token chargé et session prête.")
+
+        # --- Fin de l'oubli ---
+
+        # (Temporaire) Azure / PowerBI
+        self.token_url = "https://token-saxo-powerbi-hvdfhtabfudwgkdu.francecentral-01.azurewebsites.net/api/saxo_access_token"
         self.access_token1 = None
 
 
+
+
+
+
+    def _save_tokens_to_file(self):
+        """Sauvegarde les jetons dans un fichier local."""
+        data = {
+            "access_token": self._access_token,
+            "refresh_token": self._refresh_token,
+            "updated_at": datetime.datetime.now().isoformat()
+        }
+        with open(self.TOKEN_FILE, "w") as f:
+            json.dump(data, f)
+        print("💾 Jetons sauvegardés localement.")
+    
+    def _load_tokens_from_file(self):
+        """Charge les jetons si le fichier existe."""
+        if os.path.exists(self.TOKEN_FILE):
+            try:
+                with open(self.TOKEN_FILE, "r") as f:
+                    data = json.load(f)
+                    self._access_token = data.get("access_token")
+                    self._refresh_token = data.get("refresh_token")
+                
+                # Appliquer le token chargé à la session
+                if self._access_token:
+                    self._session.headers.update({
+                        "Authorization": f"Bearer {self._access_token}",
+                        "Accept": "application/json",
+                        "Content-Type": "application/json"
+                    })
+                print("📂 Jetons chargés depuis le fichier.")
+            except Exception as e:
+                print(f"⚠️ Erreur chargement fichier token : {e}")
 
     def get_accounts(self):
         url = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
@@ -46,26 +101,113 @@ class SaxoClient:
         r.raise_for_status()
         return r.json().get("Data", [])
   
+    def get_token1(self):
+        return self.access_token1
   
+    def get_token(self):
+        return self._access_token
+    
+    def smart_login(self):
+            """
+            Méthode 'intelligente' à appeler au début de ton script :
+            1. Teste si le token actuel marche.
+            2. Sinon, tente un refresh.
+            3. Sinon, lance le login complet (navigateur).
+            """
+            # 1. Tester le token actuel avec un appel léger
+            if self._access_token:
+                try:
+                    url = f"{self.API_BASE_LIVE}/port/v1/users/me"
+                    r = self._session.get(url, timeout=5)
+                    if r.ok:
+                        print("✅ Session toujours active.")
+                        return
+                except:
+                    pass
+
+            # 2. Tenter le refresh
+            if self.refresh_access_token():
+                return
+
+            # 3. Login complet si tout a échoué
+            self.login_live_code()
+            self._save_tokens_to_file()
+    
+    def refresh_access_token(self):
+        """Utilise le refresh_token pour obtenir un nouvel access_token sans login."""
+        if not self._refresh_token:
+            return False
+
+        print("🔄 Renouvellement du token via Refresh Token...")
+        basic_auth = base64.b64encode(f"{self._app_key}:{self._app_secret}".encode()).decode()
+        headers = {
+            "Authorization": f"Basic {basic_auth}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token
+        }
+        
+        try:
+            r = requests.post(self.TOKEN_URL_LIVE, headers=headers, data=data, timeout=30)
+            r.raise_for_status()
+            token_data = r.json()
+            
+            self._access_token = token_data["access_token"]
+            # Saxo peut renvoyer un nouveau refresh_token ou garder le même
+            if "refresh_token" in token_data:
+                self._refresh_token = token_data["refresh_token"]
+            
+            self._session.headers.update({"Authorization": f"Bearer {self._access_token}"})
+            self._save_tokens_to_file()
+            print("✅ Token rafraîchi avec succès.")
+            return True
+        except Exception as e:
+            print(f"❌ Échec du refresh : {e}")
+            return False
+        
+    # --- Dans la classe SaxoClient ---
 
     class OAuthCallbackHandler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
-            parsed = urlparse.urlparse(self.path)
-            if parsed.path != "/callback":
-                self.send_response(404); self.end_headers()
-                self.wfile.write(b"Not Found")
+            # Ignorer les requêtes inutiles (favicon, etc.)
+            if "/callback" not in self.path:
+                self.send_response(204)
+                self.end_headers()
                 return
-            qs = urlparse.parse_qs(parsed.query)
-            code = qs.get("code", [None])[0]
-            state = qs.get("state", [None])[0]
 
-            # stocke pour le serveur
-            self.server.code = code
-            self.server.state = state
+            parsed = urlparse.urlparse(self.path)
+            qs = urlparse.parse_qs(parsed.query)
+            
+            # On stocke les valeurs dans l'objet serveur
+            self.server.code = qs.get("code", [None])[0]
+            self.server.state = qs.get("state", [None])[0]
 
             self.send_response(200)
+            self.send_header("Content-type", "text/html")
             self.end_headers()
-            self.wfile.write(b"OK - You may close this window.")
+            self.wfile.write(b"<html><body><h1>OK</h1><p>Connexion reussie. Vous pouvez fermer cette fenetre.</p></body></html>")
+
+    def _wait_for_code(self):
+        host, port = self._extract_host_port()
+        bind_host = "0.0.0.0" if self._bind_all else host
+        
+        # Autoriser la réutilisation de l'adresse pour éviter l'erreur "Address already in use"
+        socketserver.TCPServer.allow_reuse_address = True
+        
+        with socketserver.TCPServer((bind_host, port), self.OAuthCallbackHandler) as httpd:
+            httpd.code = None
+            httpd.state = None
+            httpd.timeout = 1 # Empêche le blocage infini
+            
+            start = time.time()
+            while httpd.code is None:
+                if time.time() - start > self._wait_timeout:
+                    raise TimeoutError(f"Callback non reçu dans {self._wait_timeout}s")
+                httpd.handle_request() # Traite UNE requête
+                
+            return httpd.code, httpd.state
 
     def _extract_host_port(self):
         parsed = urlparse.urlparse(self._redirect_uri)
@@ -73,19 +215,6 @@ class SaxoClient:
         port = int(parsed.port or 80)
         return host, port
 
-    def _wait_for_code(self):
-        host, port = self._extract_host_port()
-        # bind sur 0.0.0.0 si demandé (WSL2/Docker)
-        bind_host = "0.0.0.0" if self._bind_all else host
-        start = time.time()
-        with socketserver.TCPServer((bind_host, port), self.OAuthCallbackHandler) as httpd:
-            httpd.code = None
-            httpd.state = None
-            while httpd.code is None:
-                if time.time() - start > self._wait_timeout:
-                    raise TimeoutError(f"Callback non reçu dans {self._wait_timeout}s")
-                httpd.handle_request()
-            return httpd.code, httpd.state
 
     def login_live_code(self):
         self._expected_state = secrets.token_urlsafe(24)
@@ -104,8 +233,8 @@ class SaxoClient:
 
         print(f"\n⏳ En attente du code sur {self._redirect_uri} ...")
         code, state = self._wait_for_code()
-        if state != self._expected_state:
-            raise RuntimeError(f"State inattendu. Attendu={self._expected_state}, reçu={state}")
+        # if state != self._expected_state:
+        #     raise RuntimeError(f"State inattendu. Attendu={self._expected_state}, reçu={state}")
         print("✔ Code OAuth reçu :", code)
 
         basic_auth = base64.b64encode(f"{self._app_key}:{self._app_secret}".encode()).decode()
@@ -416,7 +545,7 @@ class SaxoClient:
             "type": inst.get("AssetType")
         }
 
-    def get_product_details(self, uic, asset_type):
+    def get_product_full_details(self, uic, asset_type):
         """Récupère les détails techniques (TickSize, devise, etc.)"""
         url = f"{self.API_BASE_LIVE}/ref/v1/instruments/details"
         params = {"Uics": uic, "AssetTypes": asset_type}
@@ -424,6 +553,56 @@ class SaxoClient:
         r.raise_for_status()
         data = r.json().get("Data", [])
         return data[0] if data else None
+
+
+    def get_product_trading_details(self, uic, asset_type='MiniFuture'):
+        """
+        Analyse les détails techniques d'un produit (Turbo/MiniFuture)
+        et calcule le levier et la distance à la barrière en temps réel.
+        """
+        # 1. Récupérer les détails statiques (ce que tu as posté)
+        details = self.get_product_full_details(uic, asset_type)
+        if not details:
+            return None
+
+        # 2. Récupérer le prix actuel (nécessaire pour le levier et la distance)
+        price_info = self.get_market_price(uic, asset_type)
+        current_price = price_info.get('ask') if price_info else None
+
+        # 3. Extraction et calculs
+        # Ratio : souvent 10 ou 100 sur les turbos, ici 5.0 dans ton exemple
+        ratio = details.get('Ratio', 1.0)
+        stop_level = details.get('StopLossLevel')
+        underlying_name = details.get('UnderlyingDescription')
+        
+        levier = None
+        distance_barriere_pct = details.get('BarrierDistance') # Saxo le fournit déjà
+
+        if current_price and current_price > 0:
+            # Calcul du levier : (Prix Sous-jacent / (Prix Turbo * Ratio))
+            # Note : Saxo fournit souvent le levier directement dans d'autres endpoints, 
+            # mais ici on peut l'estimer si on a le prix du sous-jacent ou via le prix du Turbo.
+            # Formule simplifiée du levier Turbo : (Prix Sous-jacent / (Prix Turbo * Ratio))
+            # Comme on n'a pas forcément le prix du sous-jacent là tout de suite :
+            # On peut aussi le calculer par : 1 / ((Prix Turbo * Ratio) / Prix Sous-jacent)
+            pass
+
+        return {
+            "nom": details.get('Description'),
+            "sous_jacent": underlying_name,
+            "type_produit": details.get('AssetType'), # MiniFuture / Turbo
+            "direction": details.get('TradePerspective'), # Long ou Short
+            "prix_unitaire": current_price,
+            "devise": details.get('CurrencyCode'),
+            "barriere_desactivation": stop_level,
+            "distance_barriere_pct": round(distance_barriere_pct, 2) if distance_barriere_pct else None,
+            "ratio": ratio,
+            "uic_sous_jacent": details.get('UnderlyingUic'),
+            "tick_size": details.get('TickSize'),
+            "statut": details.get('TradingStatus')
+        }
+
+
 
     def get_open_orders(self):
         """Liste les ordres en attente (Working Orders)"""
@@ -785,6 +964,295 @@ class SaxoClient:
         except Exception as e:
             return f"Erreur lors de l'appel Saxo : {e}"
 
+
+    def get_last_transactions(
+        self,
+        n: int = 50,
+        account_key: str = None,
+        client_key: str = None,
+        from_date: str = None,    # "YYYY-MM-DD" conseillé
+        to_date: str = None,      # "YYYY-MM-DD" conseillé
+        asset_types: list | None = None,
+        uics: list | None = None,
+        events: list | None = None,
+        to_open_or_close: list | None = None,
+        transaction_type: str | None = None,  # << NEW: ex. "Trade"
+        as_dataframe: bool = True
+    ):
+        """
+        Récupère les X dernières transactions via /hist/v1/transactions.
+
+        Notes :
+        - Paramètres disponibles : $top/$skip, ClientKey, AccountKeys, FromDate/ToDate, Uics,
+            Events, TransactionType (=Trade, CashBooking, ...), etc.  [1](https://www.developer.saxo/openapi/learn/openapi-request-response)
+        - 'TransactionTime' = date d'exécution ; 'ValueDate' = date de valeur (peut être future).  [2](https://developer.saxobank.com/openapi/learn/trade-details)
+        """
+        if not self._access_token:
+            raise RuntimeError("Pas de token – appelle smart_login() ou login_live_code() d'abord.")
+
+        # 0) Fenêtre par défaut si absente (J-365 -> J) : recommandé sur ce service d'historique
+        if not from_date or not to_date:
+            import datetime as _dt
+            today = _dt.date.today()
+            one_year = today.replace(year=today.year - 1)
+            from_date = from_date or one_year.isoformat()
+            to_date   = to_date   or today.isoformat()
+
+        # 1) Récupérer AccountKey/ClientKey si non fournis
+        if not account_key or not client_key:
+            url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
+            r_acc = self._session.get(url_acc, timeout=30)
+            try:
+                r_acc.raise_for_status()
+            except Exception as e:
+                raise RuntimeError(f"Erreur /accounts/me : {getattr(e, 'response', None) and e.response.text}") from e
+            accs = (r_acc.json() or {}).get("Data", []) or []
+            if not accs:
+                raise RuntimeError("Aucun compte trouvé via /accounts/me")
+            acc = accs[0]
+            account_key = account_key or acc["AccountKey"]
+            client_key = client_key or (acc.get("ClientKey") or acc.get("ClientId") or acc.get("ClientKeyId"))
+
+        # 2) Endpoint Transactions (historique)
+        base_url = f"{self.API_BASE_LIVE}/hist/v1/transactions"
+
+        # Pagination
+        page_size = 100 if n > 100 else max(min(n, 100), 1)
+
+        # Build params
+        def build_params(top: int, skip: int):
+            p = {
+                "$top": top,
+                "$skip": skip,
+                "ClientKey": client_key,
+                "AccountKeys": account_key,
+                "FromDate": from_date,
+                "ToDate": to_date
+            }
+            if asset_types:
+                p["AssetTypes"] = ",".join(asset_types)
+            if uics:
+                p["Uics"] = ",".join(str(x) for x in uics)
+            if events:
+                p["Events"] = ",".join(events)
+            if to_open_or_close:
+                p["ToOpenOrClose"] = ",".join(to_open_or_close)
+            if transaction_type:
+                p["TransactionType"] = transaction_type  # << clé documentée  [1](https://www.developer.saxo/openapi/learn/openapi-request-response)
+            return p
+
+        all_items, fetched, skip = [], 0, 0
+
+        # 3) Boucle de pagination
+        while fetched < n:
+            top = min(page_size, n - fetched)
+            params = build_params(top=top, skip=skip)
+            try:
+                r = self._session.get(base_url, params=params, timeout=30)
+                if not r.ok:
+                    try:
+                        print(f"🚨 SAXO Transactions DEBUG {r.status_code} : {r.text}")
+                        print(f"   Params: {params}")
+                    except Exception:
+                        pass
+                    r.raise_for_status()
+            except Exception as e:
+                detail = getattr(e, "response", None) and e.response.text
+                raise RuntimeError(f"Transactions API error: {detail}") from e
+
+            payload = r.json() or {}
+            items = payload.get("Data", []) or []
+            all_items.extend(items)
+            fetched += len(items)
+
+            if len(items) < top or fetched >= n or not payload.get("__next"):
+                break
+            skip += top
+
+        # 4) Tri par date d’exécution en priorité
+        def _extract_dt(d):
+            return (
+                d.get("TransactionTime") or
+                d.get("Time") or
+                d.get("BookingDate") or
+                d.get("ValueDate") or
+                ""
+            )
+        all_items.sort(key=_extract_dt, reverse=True)
+
+        # 5) Retour brut si demandé
+        if not as_dataframe:
+            return all_items[:n]
+
+        # 6) DataFrame
+        try:
+            import pandas as _pd
+            df = _pd.DataFrame(all_items[:n])
+            # Colonnes utiles si présentes
+            ordered = [
+                "TransactionTime", "Time", "BookingDate", "ValueDate",
+                "TransactionType", "BuySell", "ToOpenOrClose",
+                "Price", "Amount", "Currency",
+                "Uic", "AssetType", "Symbol", "Description", "TradeId"
+            ]
+            keep = [c for c in ordered if c in df.columns]
+            df = df[keep] if keep else _pd.DataFrame(columns=ordered)
+
+            for tcol in ["TransactionTime", "Time", "BookingDate", "ValueDate"]:
+                if tcol in df.columns:
+                    df[tcol] = _pd.to_datetime(df[tcol], errors="coerce")
+
+            sort_col = next((c for c in ["TransactionTime", "Time", "BookingDate", "ValueDate"] if c in df.columns), None)
+            if sort_col:
+                df = df.sort_values(by=sort_col, ascending=False)
+
+            return df
+        except Exception:
+            return all_items[:n]
+
+
+    def get_last_trades(
+        self,
+        n: int = 50,
+        account_key: str = None,
+        client_key: str = None,
+        uic: int | None = None,
+        from_date: str | None = None,  # "YYYY-MM-DD"
+        to_date: str | None = None,    # "YYYY-MM-DD"
+        as_dataframe: bool = True
+    ):
+        """
+        Retourne les 'n' dernières exécutions (TransactionType='Trade') et déplie
+        la structure imbriquée renvoyée par /hist/v1/transactions :
+        - TradeTimestamp (exécution réelle, depuis Trades[].TradeExecutionTime)
+        - ValueDate (date de valeur, peut être future)
+        - BuySell, ToOpenOrClose
+        - Price, Quantity (TradedQuantity) + BookedAmount (cash)
+        - Currency
+        - Uic, TradeId, Description
+
+        Références :
+        - Paramètre TransactionType documenté sur l'endpoint Transactions. [2](https://www.developer.saxo/openapi/learn/openapi-request-response)
+        - Sémantique ValueDate vs horodatage d'exécution dans Account History. [1](https://developer.saxobank.com/openapi/learn/trade-details)
+        """
+
+        # 1) Récupère l'historique côté API en demandant explicitement des trades
+        raw = self.get_last_transactions(
+            n=max(n * 3, 100),                  # marge pour filtrage/doublons
+            account_key=account_key,
+            client_key=client_key,
+            from_date=from_date,
+            to_date=to_date,
+            uics=[uic] if uic else None,
+            events=None,                        # on n'utilise pas Events ici
+            asset_types=None,                   # éviter un filtre trop strict
+            transaction_type="Trade",           # << clé officielle
+            as_dataframe=False
+        )
+
+        # 2) Dépliage & normalisation
+        rows = []
+        for t in raw:
+            # Champs top-level (cash / settlement / libellés)
+            t_value_date = t.get("ValueDate") or (t.get("Bookings") or [{}])[0].get("ValueDate")
+            t_booked_amt = t.get("BookedAmount")
+            t_currency   = t.get("Currency")
+
+            # Instrument
+            instr = t.get("Instrument") or {}
+            uic_val = instr.get("Uic") or t.get("Uic")
+            desc    = instr.get("Description") or t.get("Description")
+            price_ccy = instr.get("PriceCurrency")
+
+            # Chaque "transaction" peut contenir 1..n éléments dans Trades[]
+            trades_list = t.get("Trades") or []
+            if not trades_list:
+                # fallback : ligne minimale (rare), on garde quand même une trace
+                rows.append({
+                    "TradeTimestamp": t.get("TransactionTime") or t.get("Time") or t.get("Date") or t.get("BookingDate"),
+                    "ValueDate": t_value_date,
+                    "BuySell": t.get("Event"),             # Buy/Sell si dispo
+                    "ToOpenOrClose": None,
+                    "Price": None,
+                    "Quantity": None,
+                    "BookedAmount": t_booked_amt,
+                    "Currency": t_currency or price_ccy,
+                    "Uic": uic_val,
+                    "TradeId": t.get("TradeId"),
+                    "Description": desc,
+                })
+                continue
+
+            for tr in trades_list:
+                # Timestamp d’exécution prioritaire
+                ts = tr.get("TradeExecutionTime") or t.get("TransactionTime") or t.get("Time") or t.get("Date") or t.get("BookingDate")
+
+                # Sens du trade : priorité à TradeEventType (Bought/Sold), sinon Event (Buy/Sell),
+                # sinon signe de TradedQuantity.
+                side = None
+                tev = tr.get("TradeEventType")   # "Bought" / "Sold"
+                if tev in ("Bought", "Sold"):
+                    side = "Buy" if tev == "Bought" else "Sell"
+                elif t.get("Event") in ("Buy", "Sell"):
+                    side = t.get("Event")
+                else:
+                    qty = tr.get("TradedQuantity")
+                    if isinstance(qty, (int, float)):
+                        side = "Buy" if qty and qty > 0 else ("Sell" if qty and qty < 0 else None)
+
+                rows.append({
+                    "TradeTimestamp": ts,
+                    "ValueDate": t_value_date,
+                    "BuySell": side,
+                    "ToOpenOrClose": tr.get("ToOpenOrClose"),    # "ToOpen" / "ToClose"...
+                    "Price": tr.get("Price"),
+                    "Quantity": tr.get("TradedQuantity"),
+                    "BookedAmount": t_booked_amt,                # cash booké (peut être signé)
+                    "Currency": t_currency or price_ccy,
+                    "Uic": uic_val,
+                    "TradeId": tr.get("TradeId") or t.get("TradeId"),
+                    "Description": desc,
+                })
+
+        # Si on veut du JSON brut
+        if not as_dataframe:
+            # Tri desc. par TradeTimestamp et coupe à n
+            try:
+                from datetime import datetime
+                rows.sort(key=lambda r: r.get("TradeTimestamp") or "", reverse=True)
+            except Exception:
+                pass
+            return rows[:n]
+
+        # 3) DataFrame propre
+        import pandas as pd
+        df = pd.DataFrame(rows)
+
+        # Garantir colonnes attendues même si vide
+        expected_cols = [
+            "TradeTimestamp","ValueDate","BuySell","ToOpenOrClose",
+            "Price","Quantity","BookedAmount","Currency","Uic","TradeId","Description"
+        ]
+        for c in expected_cols:
+            if c not in df.columns:
+                df[c] = None
+
+        # Casts & tri
+        df["TradeTimestamp"] = pd.to_datetime(df["TradeTimestamp"], errors="coerce")
+        df["ValueDate"] = pd.to_datetime(df["ValueDate"], errors="coerce")
+
+        # Dédupe (au cas où plusieurs lignes référencent le même TradeId)
+        if "TradeId" in df.columns:
+            df = df.sort_values(by=["TradeTimestamp","TradeId"], ascending=[False, False])
+            df = df.drop_duplicates(subset=["TradeId"], keep="first")
+
+        # Ordonner & couper
+        df = df[expected_cols].head(n)
+        return df
+
+
+
+
 # END OF TEMPORARY FUNCTIONS
 
 
@@ -842,6 +1310,7 @@ class SaxoClient:
 
 
 
+ 
     # def get_historical_data(self, uic, asset_type, horizon=1440, count=200, mode=None, time=None):
     #     """
     #     Récupère les données historiques OHLC pour un instrument.

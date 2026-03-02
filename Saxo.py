@@ -337,98 +337,170 @@ class SaxoClient:
         liquidity = extract_liquidity(balance)
         return round(liquidity, 2)
 
-    def get_positions(self, account_key: str = None, client_key: str = None):
-        """
-        Retourne la liste des positions sous la forme :
-        [
-            {
-                "name": "Microsoft Corp",
-                "quantity": 12,
-                "asset_type": "Stock",
-                "uic": 19040
-            },
-            ...
-        ]
-        """
+    # def get_positions(self, account_key: str = None, client_key: str = None):
+    #     """
+    #     Retourne la liste des positions sous la forme :
+    #     [
+    #         {
+    #             "name": "Microsoft Corp",
+    #             "quantity": 12,
+    #             "asset_type": "Stock",
+    #             "uic": 19040
+    #         },
+    #         ...
+    #     ]
+    #     """
 
+    #     if not self._access_token:
+    #         raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
+
+    #     # 1️⃣ Choix du compte si rien n'est fourni
+    #     if not account_key or not client_key:
+    #         # Récupération des comptes
+    #         url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
+    #         r = self._session.get(url_acc, timeout=30)
+    #         r.raise_for_status()
+    #         accs = (r.json() or {}).get("Data", []) or []
+
+    #         if not accs:
+    #             raise RuntimeError("Aucun compte trouvé via /accounts/me")
+
+    #         # On prend le premier compte (tu peux ajuster)
+    #         acc = accs[0]
+    #         account_key = acc["AccountKey"]
+    #         client_key = (
+    #             acc.get("ClientKey") or 
+    #             acc.get("ClientId") or 
+    #             acc.get("ClientKeyId")
+    #         )
+
+    #     # 2️⃣ Appel des positions AVEC FieldGroups (comme ton script PowerBI)
+    #     url_pos = f"{self.API_BASE_LIVE}/port/v1/netpositions"
+    #     params = {
+    #         "AccountKey": account_key,
+    #         "ClientKey": client_key,
+    #         "FieldGroups": "DisplayAndFormat,NetPositionBase,NetPositionView"
+    #     }
+
+    #     rp = self._session.get(url_pos, params=params, timeout=30)
+    #     rp.raise_for_status()
+    #     items = (rp.json() or {}).get("Data", []) or []
+
+    #     results = []
+
+    #     for it in items:
+    #         display = it.get("DisplayAndFormat", {}) or {}
+    #         base    = it.get("NetPositionBase", {}) or {}
+    #         instr   = it.get("Instrument", {}) or {}
+
+    #         # Nom du produit : même logique que ton code PowerBI
+    #         name = (
+    #             display.get("Description")
+    #             or instr.get("Description")
+    #             or instr.get("Symbol")
+    #             or f"{instr.get('AssetType','INCONNU')} {instr.get('Uic','')}".strip()
+    #             or "INCONNU"
+    #         )
+
+    #         # Quantité
+    #         try:
+    #             qty = float(base.get("Amount") or 0)
+    #         except:
+    #             qty = 0.0
+
+    #         # Type d'actif & UIC
+    #         asset_type = instr.get("AssetType", "INCONNU")
+    #         uic = instr.get("Uic")
+
+    #         # On ne garde que les positions avec quantité ≠ 0
+    #         if qty != 0:
+    #             results.append({
+    #                 "name": name,
+    #                 "quantity": qty,
+    #                 "asset_type": asset_type,
+    #                 "uic": uic
+    #             })
+
+    #     return pd.DataFrame( results)
+
+    
+    def get_positions(self, account_key: str = None, client_key: str = None):
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
-        # 1️⃣ Choix du compte si rien n'est fourni
+        # 1️⃣ Récupération des clés
         if not account_key or not client_key:
-            # Récupération des comptes
             url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
             r = self._session.get(url_acc, timeout=30)
-            r.raise_for_status()
-            accs = (r.json() or {}).get("Data", []) or []
+            accs = r.json().get("Data", [])
+            if not accs: return pd.DataFrame()
+            account_key, client_key = accs[0]["AccountKey"], accs[0].get("ClientKey")
 
-            if not accs:
-                raise RuntimeError("Aucun compte trouvé via /accounts/me")
-
-            # On prend le premier compte (tu peux ajuster)
-            acc = accs[0]
-            account_key = acc["AccountKey"]
-            client_key = (
-                acc.get("ClientKey") or 
-                acc.get("ClientId") or 
-                acc.get("ClientKeyId")
-            )
-
-        # 2️⃣ Appel des positions AVEC FieldGroups (comme ton script PowerBI)
+        # 2️⃣ Appel NetPositions
         url_pos = f"{self.API_BASE_LIVE}/port/v1/netpositions"
         params = {
             "AccountKey": account_key,
             "ClientKey": client_key,
             "FieldGroups": "DisplayAndFormat,NetPositionBase,NetPositionView"
         }
-
         rp = self._session.get(url_pos, params=params, timeout=30)
-        rp.raise_for_status()
-        items = (rp.json() or {}).get("Data", []) or []
-
+        items = rp.json().get("Data", [])
+        
         results = []
-
         for it in items:
-            display = it.get("DisplayAndFormat", {}) or {}
-            base    = it.get("NetPositionBase", {}) or {}
-            instr   = it.get("Instrument", {}) or {}
+            display = it.get("DisplayAndFormat", {})
+            base = it.get("NetPositionBase", {})
+            view = it.get("NetPositionView", {})
+            uic = base.get("Uic")
+            asset_type = base.get("AssetType")
+            qty = float(base.get("Amount") or 0)
 
-            # Nom du produit : même logique que ton code PowerBI
-            name = (
-                display.get("Description")
-                or instr.get("Description")
-                or instr.get("Symbol")
-                or f"{instr.get('AssetType','INCONNU')} {instr.get('Uic','')}".strip()
-                or "INCONNU"
-            )
+            if qty == 0: continue
 
-            # Quantité
-            try:
-                qty = float(base.get("Amount") or 0)
-            except:
-                qty = 0.0
+            # --- RÉCUPÉRATION DU PRIX ACTUEL (FORCE) ---
+            curr_price = view.get("MarketPrice")
+            if curr_price is None or curr_price == 0:
+                # On utilise ta fonction existante pour récupérer le prix réel
+                price_data = self.get_market_price(uic, asset_type)
+                if price_data:
+                    curr_price = price_data.get('ask') or price_data.get('bid')
 
-            # Type d'actif & UIC
-            asset_type = instr.get("AssetType", "INCONNU")
-            uic = instr.get("Uic")
+            # --- RÉCUPÉRATION DU PRIX D'ACHAT (PRU) ---
+            buying_price = base.get("AveragePrice")
+            # Si le PRU est vide (cas de ton LVMH), on peut le déduire du PnL si disponible
+            # ou laisser à 0 pour le moment.
+            
+            # --- CALCUL VALORISATION ---
+            valuation = view.get("Value")
+            if (valuation is None or valuation == 0) and curr_price:
+                valuation = curr_price * qty
 
-            # On ne garde que les positions avec quantité ≠ 0
-            if qty != 0:
-                results.append({
-                    "name": name,
-                    "quantity": qty,
-                    "asset_type": asset_type,
-                    "uic": uic
-                })
+            # --- PNL ---
+            pnl = view.get("ProfitLossOnTrade", 0.0)
 
-        return {
-            "account_key_used": account_key,
-            "client_key_used": client_key,
-            "positions": results
-        }
+            results.append({
+                "name": display.get("Description"),
+                "asset_type": asset_type,
+                "uic": uic,
+                "quantity": qty,
+                "buying_price": buying_price or 0.0,
+                "current_price": curr_price or 0.0,
+                "pnl": round(pnl, 2),
+                "total_valuation": round(valuation, 2) if valuation else 0.0,
+                "currency": display.get("Currency")
+            })
+
+        df = pd.DataFrame(results)
+        
+        # Calcul du PnL %
+        if not df.empty:
+            df['pnl_pct'] = 0.0
+            mask = (df['buying_price'] > 0)
+            df.loc[mask, 'pnl_pct'] = (df['pnl'] / (df['buying_price'] * df['quantity'])) * 100
+            
+        return df
 
 
-   
     def get_total(self):
 
         """
@@ -604,7 +676,7 @@ class SaxoClient:
 
 
 
-    def get_open_orders(self):
+    def get_open_orders_full_info(self):
         """Liste les ordres en attente (Working Orders)"""
         url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
         acc = self._session.get(url_acc).json()['Data'][0]
@@ -614,6 +686,23 @@ class SaxoClient:
         r = self._session.get(url, params=params)
         r.raise_for_status()
         return r.json().get("Data", [])
+    
+    def get_open_orders(self):
+        """Version simplifiée de get_open_orders_full_info() pour juste les infos essentielles comme un df."""
+        orders = self.get_open_orders_full_info()
+        simplified = []
+        for o in orders:
+            simplified.append({
+                "OrderId": o.get("OrderId"),
+                "Uic": o.get("Uic"),
+                "AssetType": o.get("AssetType"),
+                "Amount": o.get("Amount"),
+                "BuySell": o.get("BuySell"),
+                "OrderPrice": o.get("Price"),
+                "Status": o.get("Status")
+            })
+        return pd.DataFrame(simplified)
+        
 
     def order(self, SellBuy: str, isLimit: bool, Price: float = None, productInfo: dict = None, amount: float = None):
 

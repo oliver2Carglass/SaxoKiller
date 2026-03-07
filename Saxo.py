@@ -40,8 +40,6 @@ class SaxoClient:
             "Accept": "application/json",
             "Content-Type": "application/json"
         })
-
-        # --- CE QUE TU AS OUBLIÉ : ---
         
         # 1. Charger les tokens si le fichier existe déjà
         self._load_tokens_from_file()
@@ -53,13 +51,8 @@ class SaxoClient:
             })
             print("🔑 Token chargé et session prête.")
 
-        # --- Fin de l'oubli ---
 
-        # (Temporaire) Azure / PowerBI
-        self.token_url = "https://token-saxo-powerbi-hvdfhtabfudwgkdu.francecentral-01.azurewebsites.net/api/saxo_access_token"
-        self.access_token1 = None
-
-
+       
 
 
 
@@ -100,9 +93,6 @@ class SaxoClient:
         r = self._session.get(url, timeout=30)
         r.raise_for_status()
         return r.json().get("Data", [])
-  
-    def get_token1(self):
-        return self.access_token1
   
     def get_token(self):
         return self._access_token
@@ -336,104 +326,20 @@ class SaxoClient:
 
         liquidity = extract_liquidity(balance)
         return round(liquidity, 2)
-
-    # def get_positions(self, account_key: str = None, client_key: str = None):
-    #     """
-    #     Retourne la liste des positions sous la forme :
-    #     [
-    #         {
-    #             "name": "Microsoft Corp",
-    #             "quantity": 12,
-    #             "asset_type": "Stock",
-    #             "uic": 19040
-    #         },
-    #         ...
-    #     ]
-    #     """
-
-    #     if not self._access_token:
-    #         raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
-
-    #     # 1️⃣ Choix du compte si rien n'est fourni
-    #     if not account_key or not client_key:
-    #         # Récupération des comptes
-    #         url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
-    #         r = self._session.get(url_acc, timeout=30)
-    #         r.raise_for_status()
-    #         accs = (r.json() or {}).get("Data", []) or []
-
-    #         if not accs:
-    #             raise RuntimeError("Aucun compte trouvé via /accounts/me")
-
-    #         # On prend le premier compte (tu peux ajuster)
-    #         acc = accs[0]
-    #         account_key = acc["AccountKey"]
-    #         client_key = (
-    #             acc.get("ClientKey") or 
-    #             acc.get("ClientId") or 
-    #             acc.get("ClientKeyId")
-    #         )
-
-    #     # 2️⃣ Appel des positions AVEC FieldGroups (comme ton script PowerBI)
-    #     url_pos = f"{self.API_BASE_LIVE}/port/v1/netpositions"
-    #     params = {
-    #         "AccountKey": account_key,
-    #         "ClientKey": client_key,
-    #         "FieldGroups": "DisplayAndFormat,NetPositionBase,NetPositionView"
-    #     }
-
-    #     rp = self._session.get(url_pos, params=params, timeout=30)
-    #     rp.raise_for_status()
-    #     items = (rp.json() or {}).get("Data", []) or []
-
-    #     results = []
-
-    #     for it in items:
-    #         display = it.get("DisplayAndFormat", {}) or {}
-    #         base    = it.get("NetPositionBase", {}) or {}
-    #         instr   = it.get("Instrument", {}) or {}
-
-    #         # Nom du produit : même logique que ton code PowerBI
-    #         name = (
-    #             display.get("Description")
-    #             or instr.get("Description")
-    #             or instr.get("Symbol")
-    #             or f"{instr.get('AssetType','INCONNU')} {instr.get('Uic','')}".strip()
-    #             or "INCONNU"
-    #         )
-
-    #         # Quantité
-    #         try:
-    #             qty = float(base.get("Amount") or 0)
-    #         except:
-    #             qty = 0.0
-
-    #         # Type d'actif & UIC
-    #         asset_type = instr.get("AssetType", "INCONNU")
-    #         uic = instr.get("Uic")
-
-    #         # On ne garde que les positions avec quantité ≠ 0
-    #         if qty != 0:
-    #             results.append({
-    #                 "name": name,
-    #                 "quantity": qty,
-    #                 "asset_type": asset_type,
-    #                 "uic": uic
-    #             })
-
-    #     return pd.DataFrame( results)
-
     
+    import pandas as pd
+
     def get_positions(self, account_key: str = None, client_key: str = None):
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
-        # 1️⃣ Récupération des clés
+        # 1️⃣ Récupération des clés si non fournies
         if not account_key or not client_key:
             url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
             r = self._session.get(url_acc, timeout=30)
             accs = r.json().get("Data", [])
-            if not accs: return pd.DataFrame()
+            if not accs: 
+                return pd.DataFrame()
             account_key, client_key = accs[0]["AccountKey"], accs[0].get("ClientKey")
 
         # 2️⃣ Appel NetPositions
@@ -443,6 +349,7 @@ class SaxoClient:
             "ClientKey": client_key,
             "FieldGroups": "DisplayAndFormat,NetPositionBase,NetPositionView"
         }
+        
         rp = self._session.get(url_pos, params=params, timeout=30)
         items = rp.json().get("Data", [])
         
@@ -451,55 +358,66 @@ class SaxoClient:
             display = it.get("DisplayAndFormat", {})
             base = it.get("NetPositionBase", {})
             view = it.get("NetPositionView", {})
+            opts = base.get("OptionsData", {}) 
+            
             uic = base.get("Uic")
             asset_type = base.get("AssetType")
             qty = float(base.get("Amount") or 0)
-
             if qty == 0: continue
 
-            # --- RÉCUPÉRATION DU PRIX ACTUEL (FORCE) ---
-            curr_price = view.get("MarketPrice")
-            if curr_price is None or curr_price == 0:
-                # On utilise ta fonction existante pour récupérer le prix réel
-                price_data = self.get_market_price(uic, asset_type)
-                if price_data:
-                    curr_price = price_data.get('ask') or price_data.get('bid')
-
-            # --- RÉCUPÉRATION DU PRIX D'ACHAT (PRU) ---
-            buying_price = base.get("AveragePrice")
-            # Si le PRU est vide (cas de ton LVMH), on peut le déduire du PnL si disponible
-            # ou laisser à 0 pour le moment.
+            # --- DÉTERMINATION DU SENS (CALL/PUT ou LONG/SHORT) ---
+            # On regarde d'abord le champ PutCall, sinon la perspective, sinon le nom
+            put_call = opts.get("PutCall")
+            direction = "Long" # Par défaut
             
-            # --- CALCUL VALORISATION ---
-            valuation = view.get("Value")
-            if (valuation is None or valuation == 0) and curr_price:
-                valuation = curr_price * qty
+            if put_call in ["Call", "Put"]:
+                direction = put_call
+            else:
+                # Fallback sur TradePerspective ou analyse du nom
+                perspective = opts.get("TradePerspective")
+                if perspective in ["Long", "Short"]:
+                    direction = perspective
+                elif "Long" in display.get("Description", ""):
+                    direction = "Call"
+                elif "Short" in display.get("Description", ""):
+                    direction = "Put"
 
-            # --- PNL ---
-            pnl = view.get("ProfitLossOnTrade", 0.0)
+            # --- DONNÉES DE CALCUL ---
+            underlying_price = float(view.get("UnderlyingCurrentPrice") or 0.0)
+            curr_price = float(view.get("CurrentPrice") or 0.0)
+            strike = float(opts.get("Strike") or opts.get("FinancingLevel") or 0.0)
+            ratio = float(opts.get("Ratio") or 1.0)
+
+            # --- CALCUL DU LEVIER PRÉCIS ---
+            leverage = 0.0
+            if underlying_price > 0 and strike > 0 and (underlying_price != strike):
+                leverage = underlying_price / abs(underlying_price - strike)
+            elif underlying_price > 0 and curr_price > 0:
+                leverage = underlying_price / (curr_price * ratio)
 
             results.append({
                 "name": display.get("Description"),
-                "asset_type": asset_type,
+                "type": direction,  # Ajout du sens ici
                 "uic": uic,
                 "quantity": qty,
-                "buying_price": buying_price or 0.0,
-                "current_price": curr_price or 0.0,
-                "pnl": round(pnl, 2),
-                "total_valuation": round(valuation, 2) if valuation else 0.0,
+                "buying_price": float(view.get("AverageOpenPrice") or 0.0),
+                "current_price": curr_price,
+                "underlying_price": underlying_price,
+                "strike": round(strike, 2),
+                "leverage": round(leverage, 2),
+                "pnl (€)": round(float(view.get("ProfitLossOnTrade", 0.0)), 2),
                 "currency": display.get("Currency")
             })
 
+        # 3️⃣ Création du DataFrame et calculs finaux
         df = pd.DataFrame(results)
         
-        # Calcul du PnL %
         if not df.empty:
-            df['pnl_pct'] = 0.0
-            mask = (df['buying_price'] > 0)
-            df.loc[mask, 'pnl_pct'] = (df['pnl'] / (df['buying_price'] * df['quantity'])) * 100
+            df['pnl (%)'] = 0.0
+            mask = (df['buying_price'] > 0) & (df['quantity'] != 0)
+            df.loc[mask, 'pnl (%)'] = round((df['pnl (€)'] / (df['buying_price'] * df['quantity'])) * 100, 2)
             
         return df
-
 
     def get_total(self):
 
@@ -804,10 +722,43 @@ class SaxoClient:
         return data
 
 
+    def get_chart_data_range(self, uic, start_time, end_time, asset_type='Stock', horizon=1440):
+        """
+        Récupère les données historiques entre deux dates.
+        Note: asset_type doit correspondre au type réel de l'instrument (ex: 'Stock', 'CfdOnStock', 'WarrantKnockOut').
+        """
+        if isinstance(start_time, str):
+            start_dt = pd.to_datetime(start_time)
+        else:
+            start_dt = start_time
+            
+        if isinstance(end_time, str):
+            end_dt = pd.to_datetime(end_time)
+        else:
+            end_dt = end_time
 
+        # Calcul du nombre de barres
+        delta_minutes = (end_dt - start_dt).total_seconds() / 60
+        needed_count = int(delta_minutes / horizon) + 2 
+        
+        # Limite de sécurité Saxo
+        if needed_count > 1200:
+            needed_count = 1200
 
+        # Format ISO avec 'Z' requis par Saxo
+        end_time_iso = end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-# TEMPORARY : FONCTION DE RÉCUPÉRATION DES DONNÉES HISTORIQUES AVEC FORMATAGE PANDAS   
+        print(f"📊 Mode: UpTo | Date: {end_time_iso} | Count: {needed_count} | Asset: {asset_type}")
+        
+        return self.get_chart_data(
+            uic=uic,
+            asset_type=asset_type,
+            horizon=horizon,
+            count=needed_count,
+            mode='UpTo',
+            time=end_time_iso
+        )
+
     def get_chart_data(self, uic, asset_type='FxSpot', horizon=1440, count=200, mode=None, time=None):
         """
         Récupère les données historiques pour un instrument
@@ -883,64 +834,12 @@ class SaxoClient:
             if hasattr(e, 'response') and e.response is not None:
                 print(f"   Réponse: {e.response.text}")
             raise
-
-    def decode_token_info(self):
-        """Décode et affiche les informations du token JWT (sans vérification de signature)"""
-        if not self.access_token1:
-            return None
-            
-        try:
-            # Extraction du payload (partie centrale du JWT)
-            parts = self.access_token1.split('.')
-            if len(parts) != 3:
-                return None
-                
-            # Ajout du padding si nécessaire
-            payload = parts[1]
-            padding = len(payload) % 4
-            if padding:
-                payload += '=' * (4 - padding)
-                
-            # Décodage base64
-            decoded = base64.urlsafe_b64decode(payload)
-            token_data = json.loads(decoded)
-            
-            # print("\n🔍 Informations du token:")
-            # print(f"  - User ID: {token_data.get('uid', 'N/A')}")
-            # print(f"  - Client ID: {token_data.get('cid', 'N/A')}")
-            # print(f"  - Application ID: {token_data.get('aid', 'N/A')}")
-            # print(f"  - Expiration: {token_data.get('exp', 'N/A')}")
-            # if 'exp' in token_data:
-            #     exp_date = datetime.fromtimestamp(int(token_data['exp']))
-            #     print(f"    ({exp_date})")
-            # print(f"  - Issuer: {token_data.get('iss', 'N/A')}")
-            
-            return token_data
-        except Exception as e:
-            print(f"⚠ Impossible de décoder le token: {e}")
-            return None
-        
-    def get_access_token(self):
-        """Récupère le token d'accès depuis l'endpoint Azure"""
-        try:
-            response = requests.get(self.token_url)
-            response.raise_for_status()
-            data = response.json()
-            self.access_token1 = data['access_token']
-            # print("✓ Token récupéré avec succès")
-            # print(f"  Token (premiers caractères): {self.access_token1[:50]}...")
-            self.decode_token_info()
-            return self.access_token1
-        except Exception as e:
-            print(f"❌ Erreur lors de la récupération du token: {e}")
-            raise
     
     def _get_headers(self):
         """Retourne les headers nécessaires pour les requêtes API"""
-        if not self.access_token1:
-            self.get_access_token()
+
         return {
-            'Authorization': f'BEARER {self.access_token1}',
+            'Authorization': f'BEARER {self._access_token}',
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         }
@@ -963,7 +862,7 @@ class SaxoClient:
             # On utilise self._session qui possède déjà les headers si login_live_code() a été appelé
             # Sinon, on tente d'utiliser les headers du token Azure (access_token1)
             headers = self._session.headers
-            if not headers.get('Authorization') and self.access_token1:
+            if not headers.get('Authorization') and self._access_token:
                 headers = self._get_headers()
 
             response = self._session.get(url, params=params, headers=headers, timeout=30)
@@ -998,17 +897,9 @@ class SaxoClient:
         Récupère le prix en forçant la mise à jour du token depuis l'API Azure.
         Utile pour les instruments spécifiques comme les CFD ou les Turbos.
         """
-        # 1. Récupération d'un token tout neuf
-        try:
-            token_res = requests.get(self.token_url, timeout=10)
-            token_res.raise_for_status()
-            token = token_res.json()['access_token']
-        except Exception as e:
-            return f"Erreur lors de la récupération du token Azure : {e}"
-
         # 2. Configuration de la requête
         headers = {
-            'Authorization': f'Bearer {token}',
+            'Authorization': f'Bearer {self._access_token}',
             'Content-Type': 'application/json'
         }
         
@@ -1340,126 +1231,3 @@ class SaxoClient:
         return df
 
 
-
-
-# END OF TEMPORARY FUNCTIONS
-
-
-
-
-
-
-
-
-
-    # def get_product_current_prices(self, uic, asset_type):
-    #     if not self._access_token:
-    #         raise RuntimeError("Pas de token.")
-
-    #     url = f"{self.API_BASE_LIVE}/trade/v1/infoprices"
-    #     params = {
-    #         'Uic': uic,
-    #         'AssetType': asset_type,
-    #         'FieldGroups': 'Quote,DisplayAndFormat,PriceInfoDetails'
-    #     }
-
-    #     r = self._session.get(url, params=params, timeout=30)
-        
-    #     if not r.ok:
-    #         return f"Erreur API : {r.status_code}"
-
-    #     data = r.json()
-    #     quote = data.get('Quote', {})
-    #     price_details = data.get('PriceInfoDetails', {})
-        
-    #     # Récupération des valeurs
-    #     bid = quote.get('Bid')
-    #     ask = quote.get('Ask')
-    #     last = quote.get('LastTraded') or quote.get('LastPrice')
-    #     last_close = price_details.get('LastClose')
-
-    #     # Analyse du statut des droits
-    #     has_access = quote.get('PriceTypeAsk') != 'NoAccess'
-        
-    #     # Si on n'a pas accès au temps réel, on utilise la clôture comme prix par défaut
-    #     display_price = last if last else last_close
-
-    #     return {
-    #         "Dernier_Prix": display_price,
-    #         "Achat_Bid": bid,
-    #         "Vente_Ask": ask,
-    #         "Cloture_Precedente": last_close,
-    #         "Statut_Flux": "LIVE" if has_access else "DIFFÉRÉ/NO_ACCESS",
-    #         "Instrument": data.get('DisplayAndFormat', {}).get('Description'),
-    #         "Message": "⚠️ Activez le flux Euronext dans SaxoTrader pour voir le Bid/Ask" if not has_access else "OK"
-    #     }
-    
-
-
-
-
-
- 
-    # def get_historical_data(self, uic, asset_type, horizon=1440, count=200, mode=None, time=None):
-    #     """
-    #     Récupère les données historiques OHLC pour un instrument.
-        
-    #     Args:
-    #         uic (int): Code de l'instrument (ex: 21 pour EUR/USD)
-    #         asset_type (str): Type d'actif (FxSpot, Stock, WarrantKnockOut, etc.)
-    #         horizon (int): Intervalle en minutes (1, 5, 15, 60, 1440=Daily)
-    #         count (int): Nombre de bougies à récupérer (max 1200)
-    #         mode (str): 'From' (depuis une date) ou 'UpTo' (jusqu'à une date)
-    #         time (str): Date au format ISO (ex: '2026-02-13T00:00:00Z')
-        
-    #     Returns:
-    #         list: Liste de dictionnaires contenant les données OHLC
-    #     """
-    #     if not self._access_token:
-    #         raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
-
-    #     url = f"{self.API_BASE_LIVE}/chart/v3/charts"
-        
-    #     params = {
-    #         'Uic': uic,
-    #         'AssetType': asset_type,
-    #         'Horizon': horizon,
-    #         'Count': count,
-    #         'FieldGroups': 'Data'
-    #     }
-
-    #     # Ajout des filtres temporels si spécifiés
-    #     if mode and time:
-    #         params['Mode'] = mode
-    #         params['Time'] = time
-
-    #     r = self._session.get(url, params=params, timeout=30)
-        
-    #     if not r.ok:
-    #         print(f"🚨 Erreur historique ({r.status_code}): {r.text}")
-    #         r.raise_for_status()
-
-    #     data = r.json()
-    #     samples = data.get('Data', [])
-        
-    #     print(f"✓ {len(samples)} barres récupérées pour l'UIC {uic}")
-    #     return samples
-    
-    # def get_historical_df(self, uic, asset_type, horizon=1440, count=200):
-    #     """Récupère l'historique et retourne un Pandas DataFrame formaté"""
-    #     samples = self.get_historical_data(uic, asset_type, horizon, count)
-        
-    #     if not samples:
-    #         return pd.DataFrame()
-            
-    #     df = pd.DataFrame(samples)
-    #     df['Time'] = pd.to_datetime(df['Time'])
-    #     df.set_index('Time', inplace=True)
-        
-    #     # Nettoyage automatique pour le Forex (moyenne Bid/Ask)
-    #     if 'OpenBid' in df.columns:
-    #         for col in ['Open', 'High', 'Low', 'Close']:
-    #             df[col] = (df[f'{col}Bid'] + df[f'{col}Ask']) / 2
-                
-    #     return df
-    

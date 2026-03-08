@@ -55,7 +55,12 @@ class SaxoClient:
        
 
 
-
+    def set_acess_token(self, token):
+        """Permet de définir manuellement un access_token (utile pour les tests)."""
+        self._access_token = token
+        self._session.headers.update({
+            "Authorization": f"Bearer {self._access_token}"
+        })
 
     def _save_tokens_to_file(self):
         """Sauvegarde les jetons dans un fichier local."""
@@ -253,9 +258,6 @@ class SaxoClient:
 
 
 
-
-
-
 # GET DATA WITH MARKET !!
     def get_cash(self):
         """
@@ -418,78 +420,6 @@ class SaxoClient:
             df.loc[mask, 'pnl (%)'] = round((df['pnl (€)'] / (df['buying_price'] * df['quantity'])) * 100, 2)
             
         return df
-
-    def get_total(self):
-
-        """
-        Retourne le cash disponible (CashBalance) pour le compte principal Saxo.
-        Nécessite : ClientKey et AccountKey.
-        """
-        if not self._access_token:
-            raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
-
-        # 1️⃣ Récupérer comptes pour obtenir ClientKey + AccountKey
-        url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
-        r = self._session.get(url_acc, timeout=30)
-        r.raise_for_status()
-        accs = (r.json() or {}).get("Data", []) or []
-
-        if not accs:
-            raise RuntimeError("Impossible de récupérer les comptes via /accounts/me")
-
-        # Sélection du premier compte (ou celui qui a du cash)
-        selected = None
-        for a in accs:
-            try:
-                if float(a.get("CashBalance") or 0) != 0:
-                    selected = a
-                    break
-            except:
-                pass
-
-        if not selected:
-            selected = accs[0]
-
-        account_key = selected["AccountKey"]
-        client_key = (
-            selected.get("ClientKey") or
-            selected.get("ClientId") or
-            selected.get("ClientKeyId")
-        )
-
-        if not client_key:
-            raise RuntimeError("ClientKey introuvable dans les données du compte")
-
-        # 2️⃣ Appel balances (doit obligatoirement inclure ClientKey + AccountKey)
-        url_bal = f"{self.API_BASE_LIVE}/port/v1/balances"
-        params = {
-            "ClientKey": client_key,
-            "AccountKey": account_key
-        }
-
-        rb = self._session.get(url_bal, params=params, timeout=30)
-        rb.raise_for_status()
-        data = rb.json() or {}
-
-        # 3️⃣ Extraction du CashBalance selon le format retourné
-        def extract_cash(obj):
-            if not obj:
-                return 0.0
-            for key in ["CashBalance", "AvailableCash", "NetFreeMargin"]:
-                val = obj.get(key)
-                if isinstance(val, (int, float, str)) and val not in (None, ""):
-                    try: return float(val)
-                    except: pass
-            return 0.0
-
-        # Plusieurs formats possibles : { Balance:{...} } ou { Data:[{Balance:{...}}] }
-        if "Data" in data:
-            balance_obj = data["Data"][0].get("Balance", {})
-        else:
-            balance_obj = data.get("Balance", data)
-
-        cash = extract_cash(balance_obj)
-        return cash
 
     def info_needed_for_trading(self, ISIN: str):
         """
@@ -706,21 +636,7 @@ class SaxoClient:
                     cancelled_count += 1
         return cancelled_count
 
-    def diagnostic_turbo(self, uic):
-
-        url = f"{self.API_BASE_LIVE}/trade/v1/infoprices"
-        # On teste sans AssetType pour voir ce que le serveur suggère
-        params = {'Uic': uic, 'AssetType': 'WarrantKnockOut', 'FieldGroups': 'Quote,PriceInfoDetails'}
-        r = self._session.get(url, params=params)
-        data = r.json()
-        
-        quote = data.get('Quote', {})
-        print(f"--- DIAGNOSTIC UIC {uic} ---")
-        print(f"PriceTypeAsk: {quote.get('PriceTypeAsk')}") # Doit être 'Firm' ou 'Indicative'
-        print(f"ErrorCode: {quote.get('ErrorCode')}")
-        print(f"PriceSource: {data.get('PriceSource')}")
-        return data
-
+  
 
     def get_chart_data_range(self, uic, start_time, end_time, asset_type='Stock', horizon=1440):
         """

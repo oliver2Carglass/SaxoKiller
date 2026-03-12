@@ -264,7 +264,7 @@ class SaxoClient:
         Retourne UNIQUEMENT les liquidités disponibles (= CashAvailableForTrading).
         C’est la vraie valeur des liquidités utilisables.
         """
-
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
@@ -332,6 +332,7 @@ class SaxoClient:
     import pandas as pd
 
     def get_positions(self, account_key: str = None, client_key: str = None):
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
@@ -428,7 +429,7 @@ class SaxoClient:
         - Fallback avec suffixe ISIN
         - Renvoie UIC + AssetType
         """
-
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
@@ -467,6 +468,7 @@ class SaxoClient:
 
     def get_product_full_details(self, uic, asset_type):
         """Récupère les détails techniques (TickSize, devise, etc.)"""
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         url = f"{self.API_BASE_LIVE}/ref/v1/instruments/details"
         params = {"Uics": uic, "AssetTypes": asset_type}
         r = self._session.get(url, params=params)
@@ -480,6 +482,7 @@ class SaxoClient:
         Analyse les détails techniques d'un produit (Turbo/MiniFuture)
         et calcule le levier et la distance à la barrière en temps réel.
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         # 1. Récupérer les détails statiques (ce que tu as posté)
         details = self.get_product_full_details(uic, asset_type)
         if not details:
@@ -525,6 +528,7 @@ class SaxoClient:
 
 
     def get_open_orders_full_info(self):
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         """Liste les ordres en attente (Working Orders)"""
         url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
         acc = self._session.get(url_acc).json()['Data'][0]
@@ -537,6 +541,7 @@ class SaxoClient:
     
     def get_open_orders(self):
         """Version simplifiée de get_open_orders_full_info() pour juste les infos essentielles comme un df."""
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         orders = self.get_open_orders_full_info()
         simplified = []
         for o in orders:
@@ -557,6 +562,8 @@ class SaxoClient:
         """
         Version CORRIGÉE : Utilise la structure 'Arguments' si nécessaire et force le typage.
         """
+
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Connectez-vous d'abord.")
 
@@ -603,6 +610,7 @@ class SaxoClient:
         """
         Annule un ordre en cours via son OrderId.
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token.")
 
@@ -628,6 +636,7 @@ class SaxoClient:
         """
         Cherche et annule tous les ordres en cours pour un produit spécifique.
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         orders = self.get_open_orders()
         cancelled_count = 0
         for o in orders:
@@ -643,6 +652,7 @@ class SaxoClient:
         Récupère les données historiques entre deux dates.
         Note: asset_type doit correspondre au type réel de l'instrument (ex: 'Stock', 'CfdOnStock', 'WarrantKnockOut').
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         if isinstance(start_time, str):
             start_dt = pd.to_datetime(start_time)
         else:
@@ -690,6 +700,7 @@ class SaxoClient:
         Returns:
             pandas.DataFrame: DataFrame avec les données OHLC
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         endpoint = "https://gateway.saxobank.com/openapi/chart/v3/charts"
         
         params = {
@@ -765,6 +776,7 @@ class SaxoClient:
         Récupère les prix Bid/Ask actuels pour un instrument donné.
         Exemple: uic=21, asset_type='FxSpot' pour EURUSD.
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         # Utilisation de l'URL de base définie dans la classe
         url = f"{self.API_BASE_LIVE}/trade/v1/infoprices"
         
@@ -813,6 +825,7 @@ class SaxoClient:
         Récupère le prix en forçant la mise à jour du token depuis l'API Azure.
         Utile pour les instruments spécifiques comme les CFD ou les Turbos.
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         # 2. Configuration de la requête
         headers = {
             'Authorization': f'Bearer {self._access_token}',
@@ -875,6 +888,7 @@ class SaxoClient:
         transaction_type: str | None = None,  # << NEW: ex. "Trade"
         as_dataframe: bool = True
     ):
+        
         """
         Récupère les X dernières transactions via /hist/v1/transactions.
 
@@ -883,6 +897,7 @@ class SaxoClient:
             Events, TransactionType (=Trade, CashBooking, ...), etc.  [1](https://www.developer.saxo/openapi/learn/openapi-request-response)
         - 'TransactionTime' = date d'exécution ; 'ValueDate' = date de valeur (peut être future).  [2](https://developer.saxobank.com/openapi/learn/trade-details)
         """
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle smart_login() ou login_live_code() d'abord.")
 
@@ -1031,7 +1046,7 @@ class SaxoClient:
         - Paramètre TransactionType documenté sur l'endpoint Transactions. [2](https://www.developer.saxo/openapi/learn/openapi-request-response)
         - Sémantique ValueDate vs horodatage d'exécution dans Account History. [1](https://developer.saxobank.com/openapi/learn/trade-details)
         """
-
+        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
         # 1) Récupère l'historique côté API en demandant explicitement des trades
         raw = self.get_last_transactions(
             n=max(n * 3, 100),                  # marge pour filtrage/doublons

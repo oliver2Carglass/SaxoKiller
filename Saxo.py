@@ -94,6 +94,7 @@ class SaxoClient:
                 print(f"⚠️ Erreur chargement fichier token : {e}")
 
     def get_accounts(self):
+        self._ensure_session()
         url = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
         r = self._session.get(url, timeout=30)
         r.raise_for_status()
@@ -101,6 +102,8 @@ class SaxoClient:
   
     def get_token(self):
         return self._access_token
+    def get_refresh_token(self):
+        return self._refresh_token
     
     def smart_login(self):
             """
@@ -127,7 +130,33 @@ class SaxoClient:
             # 3. Login complet si tout a échoué
             self.login_live_code()
             self._save_tokens_to_file()
+
+
+    def _ensure_session(self):
+        """
+        Vérifie la validité de la session avant toute requête API.
+        """
+        # 1. Vérification simple via un appel léger (ex: /port/v1/users/me)
+        try:
+            url = f"{self.API_BASE_LIVE}/port/v1/users/me"
+            r = self._session.get(url, timeout=5)
+            if r.ok:
+                return True # Session active
+        except:
+            pass
+        
+        # 2. Si échec, tenter de rafraîchir
+        print("⚠️ Session expirée ou invalide. Tentative de rafraîchissement...")
+        if self.refresh_access_token():
+            return True
+        
+        # 3. Si échec du refresh, forcer le login interactif
+        print("❌ Token invalide. Relance du login nécessaire.")
+        self.login_live_code()
+        self._save_tokens_to_file()
+        return True 
     
+
     def refresh_access_token(self):
         """Utilise le refresh_token pour obtenir un nouvel access_token sans login."""
         if not self._refresh_token:
@@ -256,6 +285,41 @@ class SaxoClient:
         })
         print("\n🎉 TOKEN LIVE OBTENU !")
 
+    def get_order_status(self, order_id, account_key=None, client_key=None):
+        """
+        Récupère le statut d'un ordre spécifique.
+        """
+        self._ensure_session() # Vérifie si le token est valide
+        
+        # Si les clés ne sont pas fournies, on prend les premières par défaut
+        if not account_key or not client_key:
+            url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
+            acc_data = self._session.get(url_acc).json()
+            account_key = acc_data['Data']["AccountKey"]
+            client_key = acc_data['Data']["ClientKey"]
+
+        # Construction de l'URL avec le ClientKey et l'OrderId
+        url = f"{self.API_BASE_LIVE}/port/v1/orders/{client_key}/{order_id}/"
+        
+        # L'AccountKey doit passer en paramètre de requête
+        params = {'AccountKey': account_key}
+        
+        response = self._session.get(url, params=params)
+        print(url,params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if(data.get('Data', [{}])==[]):
+                return True
+            else :
+                status = data.get('Data', [{}])[0].get('Status')
+                print(status)
+                return False
+        else:
+            print(f"🚨 Erreur Saxo ({response.status_code}) : {response.text}")
+            return 
+
+
 
 
 # GET DATA WITH MARKET !!
@@ -264,7 +328,7 @@ class SaxoClient:
         Retourne UNIQUEMENT les liquidités disponibles (= CashAvailableForTrading).
         C’est la vraie valeur des liquidités utilisables.
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session() # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
@@ -327,14 +391,13 @@ class SaxoClient:
             balance = data.get("Balance", data)
 
         liquidity = extract_liquidity(balance)
-        return round(liquidity, 2)
-    
-    import pandas as pd
+        return round(liquidity, 3)
+
 
     def get_positions(self, account_key: str = None, client_key: str = None):
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
-        if not self._access_token:
-            raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
+        self._ensure_session()
+        # if not self._access_token:
+            # raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
         # 1️⃣ Récupération des clés si non fournies
         if not account_key or not client_key:
@@ -345,72 +408,87 @@ class SaxoClient:
                 return pd.DataFrame()
             account_key, client_key = accs[0]["AccountKey"], accs[0].get("ClientKey")
 
-        # 2️⃣ Appel NetPositions
-        url_pos = f"{self.API_BASE_LIVE}/port/v1/netpositions"
-        params = {
-            "AccountKey": account_key,
-            "ClientKey": client_key,
-            "FieldGroups": "DisplayAndFormat,NetPositionBase,NetPositionView"
-        }
-        
-        rp = self._session.get(url_pos, params=params, timeout=30)
-        items = rp.json().get("Data", [])
-        
+        # 2️⃣ Boucle de récupération par groupes (Pagination)
         results = []
-        for it in items:
-            display = it.get("DisplayAndFormat", {})
-            base = it.get("NetPositionBase", {})
-            view = it.get("NetPositionView", {})
-            opts = base.get("OptionsData", {}) 
+        top = 20  # On demande 20 positions à la fois
+        skip = 0  # On commence à l'index 0
+        
+        while True:
+            url_pos = f"{self.API_BASE_LIVE}/port/v1/netpositions"
+            params = {
+                "AccountKey": account_key,
+                "ClientKey": client_key,
+                "FieldGroups": "DisplayAndFormat,NetPositionBase,NetPositionView",
+                "$top": top,
+                "$skip": skip
+            }
             
-            uic = base.get("Uic")
-            asset_type = base.get("AssetType")
-            qty = float(base.get("Amount") or 0)
-            if qty == 0: continue
-
-            # --- DÉTERMINATION DU SENS (CALL/PUT ou LONG/SHORT) ---
-            # On regarde d'abord le champ PutCall, sinon la perspective, sinon le nom
-            put_call = opts.get("PutCall")
-            direction = "Long" # Par défaut
+            rp = self._session.get(url_pos, params=params, timeout=30)
+            data_json = rp.json()
+            items = data_json.get("Data", [])
             
-            if put_call in ["Call", "Put"]:
-                direction = put_call
-            else:
-                # Fallback sur TradePerspective ou analyse du nom
-                perspective = opts.get("TradePerspective")
-                if perspective in ["Long", "Short"]:
-                    direction = perspective
-                elif "Long" in display.get("Description", ""):
-                    direction = "Call"
-                elif "Short" in display.get("Description", ""):
-                    direction = "Put"
+            # Si la liste est vide, on a récupéré toutes les positions
+            if not items:
+                break
 
-            # --- DONNÉES DE CALCUL ---
-            underlying_price = float(view.get("UnderlyingCurrentPrice") or 0.0)
-            curr_price = float(view.get("CurrentPrice") or 0.0)
-            strike = float(opts.get("Strike") or opts.get("FinancingLevel") or 0.0)
-            ratio = float(opts.get("Ratio") or 1.0)
+            for it in items:
+                display = it.get("DisplayAndFormat", {})
+                base = it.get("NetPositionBase", {})
+                view = it.get("NetPositionView", {})
+                opts = base.get("OptionsData", {}) 
+                
+                uic = base.get("Uic")
+                qty = float(base.get("Amount") or 0)
+                if qty == 0: continue
 
-            # --- CALCUL DU LEVIER PRÉCIS ---
-            leverage = 0.0
-            if underlying_price > 0 and strike > 0 and (underlying_price != strike):
-                leverage = underlying_price / abs(underlying_price - strike)
-            elif underlying_price > 0 and curr_price > 0:
-                leverage = underlying_price / (curr_price * ratio)
+                # --- DÉTERMINATION DU SENS (CALL/PUT ou LONG/SHORT) ---
+                put_call = opts.get("PutCall")
+                direction = "Long" 
+                
+                if put_call in ["Call", "Put"]:
+                    direction = put_call
+                else:
+                    perspective = opts.get("TradePerspective")
+                    if perspective in ["Long", "Short"]:
+                        direction = perspective
+                    elif "Long" in display.get("Description", ""):
+                        direction = "Call"
+                    elif "Short" in display.get("Description", ""):
+                        direction = "Put"
 
-            results.append({
-                "name": display.get("Description"),
-                "type": direction,  # Ajout du sens ici
-                "uic": uic,
-                "quantity": qty,
-                "buying_price": float(view.get("AverageOpenPrice") or 0.0),
-                "current_price": curr_price,
-                "underlying_price": underlying_price,
-                "strike": round(strike, 2),
-                "leverage": round(leverage, 2),
-                "pnl (€)": round(float(view.get("ProfitLossOnTrade", 0.0)), 2),
-                "currency": display.get("Currency")
-            })
+                # --- DONNÉES DE CALCUL ---
+                underlying_price = float(view.get("UnderlyingCurrentPrice") or 0.0)
+                curr_price = float(view.get("CurrentPrice") or 0.0)
+                strike = float(opts.get("Strike") or opts.get("FinancingLevel") or 0.0)
+                ratio = float(opts.get("Ratio") or 1.0)
+
+                # --- CALCUL DU LEVIER ---
+                leverage = 0.0
+                if underlying_price > 0 and strike > 0 and (underlying_price != strike):
+                    leverage = underlying_price / abs(underlying_price - strike)
+                elif underlying_price > 0 and curr_price > 0:
+                    leverage = underlying_price / (curr_price * ratio)
+
+                results.append({
+                    "name": display.get("Description"),
+                    "type": direction,
+                    "uic": uic,
+                    "quantity": qty,
+                    "buying_price": float(view.get("AverageOpenPrice") or 0.0),
+                    "current_price": curr_price,
+                    "underlying_price": underlying_price,
+                    "strike": round(strike, 2),
+                    "leverage": round(leverage, 2),
+                    "pnl (€)": round(float(view.get("ProfitLossOnTrade", 0.0)), 3),
+                    "currency": display.get("Currency")
+                })
+
+            # Incrémenter le skip pour demander le groupe suivant au prochain tour
+            skip += top
+            
+            # Sécurité : Si l'API ne renvoie pas de lien vers la suite, on s'arrête
+            if "__next" not in data_json:
+                break
 
         # 3️⃣ Création du DataFrame et calculs finaux
         df = pd.DataFrame(results)
@@ -418,6 +496,7 @@ class SaxoClient:
         if not df.empty:
             df['pnl (%)'] = 0.0
             mask = (df['buying_price'] > 0) & (df['quantity'] != 0)
+            # Calcul du PnL % basé sur l'investissement total (Prix achat * Quantité)
             df.loc[mask, 'pnl (%)'] = round((df['pnl (€)'] / (df['buying_price'] * df['quantity'])) * 100, 2)
             
         return df
@@ -429,7 +508,7 @@ class SaxoClient:
         - Fallback avec suffixe ISIN
         - Renvoie UIC + AssetType
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle login_live_code() d'abord.")
 
@@ -468,7 +547,7 @@ class SaxoClient:
 
     def get_product_full_details(self, uic, asset_type):
         """Récupère les détails techniques (TickSize, devise, etc.)"""
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         url = f"{self.API_BASE_LIVE}/ref/v1/instruments/details"
         params = {"Uics": uic, "AssetTypes": asset_type}
         r = self._session.get(url, params=params)
@@ -482,7 +561,7 @@ class SaxoClient:
         Analyse les détails techniques d'un produit (Turbo/MiniFuture)
         et calcule le levier et la distance à la barrière en temps réel.
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         # 1. Récupérer les détails statiques (ce que tu as posté)
         details = self.get_product_full_details(uic, asset_type)
         if not details:
@@ -525,10 +604,73 @@ class SaxoClient:
             "statut": details.get('TradingStatus')
         }
 
+    def get_leverage(self, uic, asset_type):
+        """
+        Calcule et retourne le levier d'un produit dérivé (Turbo/MiniFuture).
+        
+        Args:
+            uic (int): UIC du produit dérivé
+            asset_type (str): Type d'actif (WarrantKnockOut, MiniFuture, etc.)
+        
+        Returns:
+            float: Levier du produit, arrondi à 2 décimales, ou None si impossible à calculer
+        """
+        self._ensure_session()
+        
+        try:
+            # 1. Récupérer les détails techniques du produit
+            details = self.get_product_full_details(uic, asset_type)
+            if not details:
+                return None
+            
+            time.sleep(0.1)
+            
+            # 2. Récupérer l'UIC du sous-jacent
+            underlying_uic = details.get('UnderlyingUic')
+            if not underlying_uic:
+                return None
+            
+            # 3. Récupérer le prix du sous-jacent
+            underlying_info = self.get_market_price(underlying_uic, "FxSpot")
+            time.sleep(0.1)
+            
+            if not underlying_info:
+                return None
+            
+            underlying_price = float(underlying_info.get('ask') or underlying_info.get('bid') or 0.0)
+            if underlying_price <= 0:
+                return None
+            
+            # 4. Récupérer le prix du produit
+            price_info = self.get_market_price(uic, asset_type)
+            time.sleep(0.1)
+            
+            if not price_info:
+                return None
+            
+            curr_price = float(price_info.get('ask') or price_info.get('bid') or 0.0)
+            if curr_price <= 0:
+                return None
+            
+            # 5. Calculer le levier
+            ratio = float(details.get('Ratio') or 1.0)
+            strike = float(details.get('Strike') or details.get('FinancingLevel') or 0.0)
+            
+            leverage = None
+            if underlying_price > 0 and strike > 0 and (underlying_price != strike):
+                leverage = underlying_price / abs(underlying_price - strike)
+            elif underlying_price > 0 and curr_price > 0:
+                leverage = underlying_price / (curr_price * ratio)
+            
+            return round(leverage, 2) if leverage and leverage > 0 else None
+        
+        except Exception as e:
+            print(f"❌ Erreur (get_leverage): {e}")
+            return None
 
 
     def get_open_orders_full_info(self):
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         """Liste les ordres en attente (Working Orders)"""
         url_acc = f"{self.API_BASE_LIVE}/port/v1/accounts/me"
         acc = self._session.get(url_acc).json()['Data'][0]
@@ -541,7 +683,7 @@ class SaxoClient:
     
     def get_open_orders(self):
         """Version simplifiée de get_open_orders_full_info() pour juste les infos essentielles comme un df."""
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         orders = self.get_open_orders_full_info()
         simplified = []
         for o in orders:
@@ -556,14 +698,17 @@ class SaxoClient:
             })
         return pd.DataFrame(simplified)
         
+        
 
     def order(self, SellBuy: str, isLimit: bool, Price: float = None, productInfo: dict = None, amount: float = None):
 
         """
         Version CORRIGÉE : Utilise la structure 'Arguments' si nécessaire et force le typage.
         """
-
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        if productInfo is None or amount is 0:
+            print("productInfo et amount sont requis avec des valeurs autorisées. on a prodInfo:", productInfo, "amount:", amount)
+            return 0 
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Connectez-vous d'abord.")
 
@@ -601,16 +746,18 @@ class SaxoClient:
         
         if not r.ok:
             print(f"DEBUG PAYLOAD: {payload}")
-            print(f"🚨 ERREUR SAXO ({r.status_code}) : {r.json()}")
+            print(f"🚨 ERREUR SAXO ({r.status_code}) : {r.text}") # .text est plus sûr si le JSON est invalide
             r.raise_for_status()
             
-        return r.json()
-    
+        # On transforme la réponse en dictionnaire pour extraire l'ID
+        data = r.json()
+        return data.get("OrderId")
+            
     def cancel_order(self, order_id):
         """
         Annule un ordre en cours via son OrderId.
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token.")
 
@@ -631,28 +778,43 @@ class SaxoClient:
             print(f"❌ Erreur lors de l'annulation : {r.text}")
             return False
 
-    def cancel_all_orders_for_uic(self, uic):
-
-        """
-        Cherche et annule tous les ordres en cours pour un produit spécifique.
-        """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
-        orders = self.get_open_orders()
-        cancelled_count = 0
-        for o in orders:
-            if o['Uic'] == uic:
-                if self.cancel_order(o['OrderId']):
-                    cancelled_count += 1
-        return cancelled_count
-
   
+
+    def cancel_all_orders_for_uic(self, uic):
+        self._ensure_session()
+        df_orders = self.get_open_orders()
+
+        # Vérification si le DataFrame est vide
+        if df_orders is None or (hasattr(df_orders, 'empty') and df_orders.empty):
+            return 0
+
+        # On transforme les lignes du DataFrame en liste de dictionnaires
+        # Chaque dictionnaire ressemblera à : {'OrderId': 53826562, 'Uic': 54780867, ...}
+        orders_list = df_orders.to_dict('records')
+
+        cancelled_count = 0
+
+        for o in orders_list:
+            # Comparaison stricte du UIC (on convertit en int pour être sûr)
+            if int(o.get("Uic", 0)) == int(uic):
+                order_id = o.get('OrderId')
+                
+                if order_id:
+                    print(f"Annulation ordre {order_id} pour le UIC {uic}...")
+                    ok = self.cancel_order(order_id)
+                    if ok:
+                        cancelled_count += 1
+                else:
+                    print("Erreur : OrderId introuvable dans la ligne.")
+
+        return cancelled_count
 
     def get_chart_data_range(self, uic, start_time, end_time, asset_type='Stock', horizon=1440):
         """
         Récupère les données historiques entre deux dates.
         Note: asset_type doit correspondre au type réel de l'instrument (ex: 'Stock', 'CfdOnStock', 'WarrantKnockOut').
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         if isinstance(start_time, str):
             start_dt = pd.to_datetime(start_time)
         else:
@@ -700,7 +862,7 @@ class SaxoClient:
         Returns:
             pandas.DataFrame: DataFrame avec les données OHLC
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         endpoint = "https://gateway.saxobank.com/openapi/chart/v3/charts"
         
         params = {
@@ -776,7 +938,7 @@ class SaxoClient:
         Récupère les prix Bid/Ask actuels pour un instrument donné.
         Exemple: uic=21, asset_type='FxSpot' pour EURUSD.
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         # Utilisation de l'URL de base définie dans la classe
         url = f"{self.API_BASE_LIVE}/trade/v1/infoprices"
         
@@ -825,7 +987,7 @@ class SaxoClient:
         Récupère le prix en forçant la mise à jour du token depuis l'API Azure.
         Utile pour les instruments spécifiques comme les CFD ou les Turbos.
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         # 2. Configuration de la requête
         headers = {
             'Authorization': f'Bearer {self._access_token}',
@@ -897,7 +1059,7 @@ class SaxoClient:
             Events, TransactionType (=Trade, CashBooking, ...), etc.  [1](https://www.developer.saxo/openapi/learn/openapi-request-response)
         - 'TransactionTime' = date d'exécution ; 'ValueDate' = date de valeur (peut être future).  [2](https://developer.saxobank.com/openapi/learn/trade-details)
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session() # S'assure que le token est valide avant de faire les appels API
         if not self._access_token:
             raise RuntimeError("Pas de token – appelle smart_login() ou login_live_code() d'abord.")
 
@@ -1046,7 +1208,7 @@ class SaxoClient:
         - Paramètre TransactionType documenté sur l'endpoint Transactions. [2](https://www.developer.saxo/openapi/learn/openapi-request-response)
         - Sémantique ValueDate vs horodatage d'exécution dans Account History. [1](https://developer.saxobank.com/openapi/learn/trade-details)
         """
-        self.smart_login()  # S'assure que le token est valide avant de faire les appels API
+        self._ensure_session()  # S'assure que le token est valide avant de faire les appels API
         # 1) Récupère l'historique côté API en demandant explicitement des trades
         raw = self.get_last_transactions(
             n=max(n * 3, 100),                  # marge pour filtrage/doublons
@@ -1162,3 +1324,112 @@ class SaxoClient:
         return df
 
 
+    def get_only_saxo_turbo_products(self, underlying_uic: int, include_non_tradable: bool = False, top: int = 1000, max_raw_products: int = None):
+        """Récupère les produits dérivés Saxo pour un underlying avec levier calculé.
+        
+        Args:
+            underlying_uic (int): UIC du sous-jacent
+            include_non_tradable (bool): Inclure les produits non tradables
+            top (int): Nombre de produits par page (pagination)
+            max_raw_products (int): Nombre maximum de produits bruts à récupérer avant filtrage.
+                                   Si None, récupère tous les produits disponibles.
+        """
+        self._ensure_session()
+
+        url = f"{self.API_BASE_LIVE}/ref/v1/instruments"
+        underlying_uic = int(underlying_uic)
+        asset_types = "WarrantKnockOut,WarrantOpenEndKnockOut,MiniFuture"
+        allowed_asset_types = {"WarrantKnockOut", "WarrantOpenEndKnockOut", "MiniFuture"}
+
+        def _safe_int(v):
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        def _extract_underlying_uic(item):
+            candidates = [
+                item.get("UnderlyingUic"),
+                item.get("UnderlyingInstrumentUic"),
+                (item.get("UnderlyingInstrument") or {}).get("Uic"),
+                (item.get("Underlying") or {}).get("Uic")
+            ]
+            for c in candidates:
+                iv = _safe_int(c)
+                if iv is not None:
+                    return iv
+            return None
+
+        try:
+            data = []
+            page_size = 100
+            skip = 0
+            
+            # Pagination simple
+            while True:
+                params = {
+                    "AssetTypes": asset_types,
+                    "UnderlyingUic": underlying_uic,
+                    "IncludeNonTradable": bool(include_non_tradable),
+                    "$top": page_size,
+                    "$skip": skip
+                }
+                
+                r = self._session.get(url, params=params, timeout=30)
+                if r.ok:
+                    batch = r.json().get("Data", []) or []
+                    if not batch:
+                        break
+                    data.extend(batch)
+                    
+                    # Arrêter si on a atteint la limite de produits bruts
+                    if max_raw_products and len(data) >= max_raw_products:
+                        data = data[:max_raw_products]
+                        break
+                    
+                    skip += page_size
+                else:
+                    break
+
+            # Filtrage local
+            data = [it for it in data if it.get("AssetType") in allowed_asset_types]
+            data = [it for it in data if "saxo" in str(it.get("ExchangeId", "")).lower()]
+            data = [it for it in data if _extract_underlying_uic(it) == underlying_uic]
+
+            if not data:
+                return pd.DataFrame()
+            
+            # Construction du DataFrame avec levier
+            rows = []
+            for item in data:
+                desc = str(item.get("Description", "")).lower()
+                direction = "Short" if "short" in desc else ("Long" if "long" in desc else "Unknown")
+                
+                uic = item.get("Identifier")
+                asset_type = item.get("AssetType")
+                leverage = None
+                
+                # Calcul du levier via la nouvelle méthode
+                try:
+                    leverage = self.get_leverage(uic, asset_type)
+                except Exception:
+                    pass
+                
+                rows.append({
+                    "uic": uic,
+                    "symbol": item.get("Symbol"),
+                    "description": item.get("Description"),
+                    "type": item.get("AssetType"),
+                    "direction": direction,
+                    "leverage": leverage,
+                    "underlying_uic": item.get("UnderlyingUic"),
+                    "currency": item.get("CurrencyCode")
+                })
+            
+            return pd.DataFrame(rows)
+
+        except Exception as e:
+            print(f"❌ Erreur (get_only_saxo_turbo_products): {e}")
+            return pd.DataFrame()
+
+  
